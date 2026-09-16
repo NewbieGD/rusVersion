@@ -7,16 +7,47 @@
     <link rel="shortcut icon" href="TemplateData/favicon.ico">
     <link rel="stylesheet" href="TemplateData/style.css">
     <script>
+      // Единое хранилище желаемого состояния звука. Заполняется ДО того,
+      // как Unity вообще создаст AudioContext, чтобы сохранённый выбор
+      // пользователя учитывался с самого первого кадра.
+      window.__audioMuteState = {
+        userMuted: (function () {
+          try { return localStorage.getItem('yarojump_sound_muted') === '1'; }
+          catch (e) { return false; }
+        })(),
+        backgrounded: false
+      };
+
       // Перехватываем создание AudioContext, который Unity создаёт для звука.
-      // Это нужно, чтобы уметь глушить/возобновлять звук игры снаружи —
-      // доступа к исходникам C# (AudioListener и т.п.) у нас нет, а сборка
+      // Доступа к исходникам C# (AudioListener и т.п.) у нас нет, а сборка
       // всегда использует именно Web Audio API для всех звуков/музыки.
+      //
+      // ВАЖНО: сам движок Unity WebGL постоянно пытается "разбудить" свой
+      // AudioContext — опросом раз в ~400мс и сразу при любом клике/тапе
+      // (это защита от политики браузеров "нельзя играть звук без действия
+      // пользователя"). Поэтому просто вызывать suspend() при выключении
+      // звука недостаточно: Unity тут же сам вызовет resume() при следующем
+      // клике (например, по кнопке "Играть"). Решение — подменить сам метод
+      // resume() у контекста: пока звук выключен пользователем (или игра
+      // свёрнута), resume() ничего не делает, кто бы его ни вызывал.
+      //
       // Должно выполниться ДО загрузки Build/*.framework.js.
       (function () {
         var Native = window.AudioContext || window.webkitAudioContext;
         if (!Native) return;
         function PatchedAudioContext(options) {
           var ctx = new Native(options);
+          var originalResume = ctx.resume.bind(ctx);
+          ctx.resume = function () {
+            var state = window.__audioMuteState;
+            if (state.userMuted || state.backgrounded) {
+              return Promise.resolve();
+            }
+            return originalResume();
+          };
+          if (window.__audioMuteState.userMuted || window.__audioMuteState.backgrounded) {
+            try { ctx.suspend(); } catch (e) {}
+          }
           window.__unityAudioContext = ctx;
           return ctx;
         }
@@ -51,9 +82,16 @@
       <div id="onboarding-card">
         <h2>Как играть</h2>
         <ol>
-          <li>Управляйте персонажем и прыгайте по платформам как можно выше.</li>
-          <li>Собирайте бонусы на пути — они дают дополнительные очки.</li>
-          <li>Не упадите вниз — при падении игра заканчивается.</li>
+          <li>Управляйте персонажем и прыгайте по платформам.</li>
+          <li>Каждая платформа имеет свой цвет.</li>
+          <li>Для каждой платформы есть соответствующая кнопка.</li>
+          <li>Мячик включает ауру под цвет кнопки при её нажатии</li>
+          <li>Если аура мячика равна цвету платформы, то даются очки</li>
+          <li>Зеленая аура +1, Желтая +2, Фиолетовая +3</li>
+          <li>Кнопка со значком черепка - даёт красную ауру</li>
+          <li>Красная аура спасает от красной платформы</li>
+          <li>Без красной ауры на красную платформу прыгать нельзя</li>
+          <li>Попробуйте набрать как можно больше очков!</li>
         </ol>
         <p style="font-size:13px;color:#666;margin-top:-8px;">
           (Замените текст выше на реальное описание механик вашей игры.)
@@ -187,21 +225,22 @@
       // ===================================================================
       var soundToggleButton = document.getElementById('sound-toggle-button');
       var SOUND_PREF_KEY = 'yarojump_sound_muted';
-      var userMuted = localStorage.getItem(SOUND_PREF_KEY) === '1';
-      var appBackgrounded = false;
+      var audioState = window.__audioMuteState; // тот же объект, что читает resume()-guard в <head>
 
       function updateSoundButtonIcon() {
-        soundToggleButton.textContent = userMuted ? '🔇' : '🔊';
-        soundToggleButton.setAttribute('aria-pressed', userMuted ? 'true' : 'false');
+        soundToggleButton.textContent = audioState.userMuted ? '🔇' : '🔊';
+        soundToggleButton.setAttribute('aria-pressed', audioState.userMuted ? 'true' : 'false');
       }
 
       function applyAudioState() {
         var ctx = window.__unityAudioContext;
-        if (!ctx) return; // AudioContext ещё не создан движком — попробуем позже
+        if (!ctx) return; // AudioContext ещё не создан движком — resume()-guard в <head> всё равно учтёт state при создании
         try {
-          if (userMuted || appBackgrounded) {
+          if (audioState.userMuted || audioState.backgrounded) {
             if (ctx.state === 'running') ctx.suspend();
           } else {
+            // ctx.resume() тут безопасен даже во время игры Unity: подмена
+            // из <head> сама решит, реально резюмить или нет, по audioState
             if (ctx.state === 'suspended') ctx.resume();
           }
         } catch (e) {
@@ -210,8 +249,8 @@
       }
 
       soundToggleButton.addEventListener('click', function () {
-        userMuted = !userMuted;
-        localStorage.setItem(SOUND_PREF_KEY, userMuted ? '1' : '0');
+        audioState.userMuted = !audioState.userMuted;
+        localStorage.setItem(SOUND_PREF_KEY, audioState.userMuted ? '1' : '0');
         updateSoundButtonIcon();
         applyAudioState();
       });
@@ -229,7 +268,7 @@
       }, 300);
 
       function setBackgrounded(isBackgrounded) {
-        appBackgrounded = isBackgrounded;
+        audioState.backgrounded = isBackgrounded;
         applyAudioState();
       }
 
