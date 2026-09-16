@@ -1,11 +1,30 @@
 <!DOCTYPE html>
-<html lang="en-us">
+<html lang="ru">
   <head>
     <meta charset="utf-8">
     <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
     <title>Unity WebGL Player | Yaro Jump</title>
     <link rel="shortcut icon" href="TemplateData/favicon.ico">
     <link rel="stylesheet" href="TemplateData/style.css">
+    <script>
+      // Перехватываем создание AudioContext, который Unity создаёт для звука.
+      // Это нужно, чтобы уметь глушить/возобновлять звук игры снаружи —
+      // доступа к исходникам C# (AudioListener и т.п.) у нас нет, а сборка
+      // всегда использует именно Web Audio API для всех звуков/музыки.
+      // Должно выполниться ДО загрузки Build/*.framework.js.
+      (function () {
+        var Native = window.AudioContext || window.webkitAudioContext;
+        if (!Native) return;
+        function PatchedAudioContext(options) {
+          var ctx = new Native(options);
+          window.__unityAudioContext = ctx;
+          return ctx;
+        }
+        PatchedAudioContext.prototype = Native.prototype;
+        window.AudioContext = PatchedAudioContext;
+        window.webkitAudioContext = PatchedAudioContext;
+      })();
+    </script>
   </head>
   <body>
     <div id="unity-container" class="unity-desktop">
@@ -22,7 +41,27 @@
         <div id="unity-fullscreen-button"></div>
         <div id="unity-build-title">Yaro Jump</div>
       </div>
+
+      <!-- п.2 требований модерации VK: возможность выключить/отрегулировать звук -->
+      <button id="sound-toggle-button" type="button" title="Вкл/выкл звук">🔊</button>
     </div>
+
+    <!-- п.5 требований модерации VK: онбординг с объяснением механик -->
+    <div id="onboarding-overlay">
+      <div id="onboarding-card">
+        <h2>Как играть</h2>
+        <ol>
+          <li>Управляйте персонажем и прыгайте по платформам как можно выше.</li>
+          <li>Собирайте бонусы на пути — они дают дополнительные очки.</li>
+          <li>Не упадите вниз — при падении игра заканчивается.</li>
+        </ol>
+        <p style="font-size:13px;color:#666;margin-top:-8px;">
+          (Замените текст выше на реальное описание механик вашей игры.)
+        </p>
+        <button id="onboarding-close-button" type="button">Понятно, играть!</button>
+      </div>
+    </div>
+
     <script>
       var container = document.querySelector("#unity-container");
       var canvas = document.querySelector("#unity-canvas");
@@ -31,12 +70,6 @@
       var fullscreenButton = document.querySelector("#unity-fullscreen-button");
       var warningBanner = document.querySelector("#unity-warning");
 
-      // Shows a temporary message banner/ribbon for a few seconds, or
-      // a permanent error message on top of the canvas if type=='error'.
-      // If type=='warning', a yellow highlight color is used.
-      // Modify or remove this function to customize the visually presented
-      // way that non-critical warnings and error messages are presented to the
-      // user.
       function unityShowBanner(msg, type) {
         function updateBannerVisibility() {
           warningBanner.style.display = warningBanner.children.length ? 'block' : 'none';
@@ -68,38 +101,28 @@
         showBanner: unityShowBanner,
       };
 
-      // By default Unity keeps WebGL canvas render target size matched with
-      // the DOM size of the canvas element (scaled by window.devicePixelRatio)
-      // Set this to false if you want to decouple this synchronization from
-      // happening inside the engine, and you would instead like to size up
-      // the canvas DOM size and WebGL render target sizes yourself.
-      // config.matchWebGLToCanvasSize = false;
-
       if (/iPhone|iPad|iPod|Android/i.test(navigator.userAgent)) {
-        // Mobile device style: fill the whole browser client area with the game canvas:
-
         var meta = document.createElement('meta');
         meta.name = 'viewport';
         meta.content = 'width=device-width, height=device-height, initial-scale=1.0, user-scalable=no, shrink-to-fit=yes';
         document.getElementsByTagName('head')[0].appendChild(meta);
         container.className = "unity-mobile";
-
-        // To lower canvas resolution on mobile devices to gain some
-        // performance, uncomment the following line:
-        // config.devicePixelRatio = 1;
-
         canvas.style.width = window.innerWidth + 'px';
         canvas.style.height = window.innerHeight + 'px';
-
         unityShowBanner('WebGL builds are not supported on mobile devices.');
       } else {
-        // Desktop style: Render the game canvas in a window that can be maximized to fullscreen:
-
         canvas.style.width = "400px";
         canvas.style.height = "1000px";
       }
 
       loadingBar.style.display = "block";
+
+      // ВАЖНО: раньше здесь была ошибка — переменная unityI, в которую
+      // ниже (в vkBridge-коде) пишут SendMessage(), нигде не объявлялась
+      // и не присваивалась. Из-за этого auth()/getUserData()/showRewardedAd()
+      // падали с ReferenceError, и, в частности, загруженный из VK Storage
+      // прогресс никогда не долетал обратно в игру (п.4 замечаний).
+      var unityI = null;
 
       var script = document.createElement("script");
       script.src = loaderUrl;
@@ -107,6 +130,7 @@
         createUnityInstance(canvas, config, (progress) => {
           progressBarFull.style.width = 100 * progress + "%";
         }).then((unityInstance) => {
+          unityI = unityInstance;
           loadingBar.style.display = "none";
           fullscreenButton.onclick = () => {
             unityInstance.SetFullscreen(1);
@@ -117,47 +141,135 @@
       };
       document.body.appendChild(script);
     </script>
-	
-	   <script src="https://unpkg.com/@vkontakte/vk-bridge/dist/browser.min.js"></script>
+
+    <script src="https://unpkg.com/@vkontakte/vk-bridge/dist/browser.min.js"></script>
 
     <script type="text/javascript">
 
       vkBridge.send('VKWebAppInit');
 
-
-
       function auth(){
-        vkBridge.send('VKWebAppGetUserInfo').then(_info =>{
+        vkBridge.send('VKWebAppGetUserInfo').then(_info => {
           console.log(_info);
-          unityI.SendMessage('VKSDK', 'AuthenticateSuccess', JSON.stringify(_info));
+          if (unityI) unityI.SendMessage('VKSDK', 'AuthenticateSuccess', JSON.stringify(_info));
         });
       }
 
       function getUserData(){
-        vkBridge.send("VKWebAppStorageGet",{"keys":["_save"]}).then(data =>{
-        console.log(data);
-        unityI.SendMessage('VKSDK', 'DataGetting', JSON.stringify(data));
-      });}
+        vkBridge.send("VKWebAppStorageGet", {"keys": ["_save"]}).then(data => {
+          console.log(data);
+          if (unityI) unityI.SendMessage('VKSDK', 'DataGetting', JSON.stringify(data));
+        });
+      }
 
       function setUserData(data){
         console.log(data);
-        vkBridge.send('VKWebAppStorageSet',{"key": "_save" , "value": data}).then(_info =>{
-          console.log("Saved!")});
+        vkBridge.send('VKWebAppStorageSet', {"key": "_save", "value": data}).then(_info => {
+          console.log("Saved!");
+        });
       }
 
       function showFullscrenAd(){
-        vkBridge.send('VKWebAppShowNativeAds',{ad_format:"interstitial"}).then(data => {
-          console.log(data);});
+        vkBridge.send('VKWebAppShowNativeAds', {ad_format: "interstitial"}).then(data => {
+          console.log(data);
+        });
       }
 
       function showRewardedAd(){
-        vkBridge.send('VKWebAppShowNativeAds',{ad_format:"reward"}).then(data => {
+        vkBridge.send('VKWebAppShowNativeAds', {ad_format: "reward"}).then(data => {
           console.log(data);
-          unityI.SendMessage('VKSDK', 'RewardGetting',JSON.stringify(data.result));})
+          if (unityI) unityI.SendMessage('VKSDK', 'RewardGetting', JSON.stringify(data.result));
+        });
       }
 
+      // ===================================================================
+      // п.2: регулировка/выключение звука + п.3: не играть музыку в фоне
+      // ===================================================================
+      var soundToggleButton = document.getElementById('sound-toggle-button');
+      var SOUND_PREF_KEY = 'yarojump_sound_muted';
+      var userMuted = localStorage.getItem(SOUND_PREF_KEY) === '1';
+      var appBackgrounded = false;
+
+      function updateSoundButtonIcon() {
+        soundToggleButton.textContent = userMuted ? '🔇' : '🔊';
+        soundToggleButton.setAttribute('aria-pressed', userMuted ? 'true' : 'false');
+      }
+
+      function applyAudioState() {
+        var ctx = window.__unityAudioContext;
+        if (!ctx) return; // AudioContext ещё не создан движком — попробуем позже
+        try {
+          if (userMuted || appBackgrounded) {
+            if (ctx.state === 'running') ctx.suspend();
+          } else {
+            if (ctx.state === 'suspended') ctx.resume();
+          }
+        } catch (e) {
+          console.warn('Audio state toggle failed:', e);
+        }
+      }
+
+      soundToggleButton.addEventListener('click', function () {
+        userMuted = !userMuted;
+        localStorage.setItem(SOUND_PREF_KEY, userMuted ? '1' : '0');
+        updateSoundButtonIcon();
+        applyAudioState();
+      });
+      updateSoundButtonIcon();
+
+      // AudioContext в Unity WebGL создаётся не мгновенно при старте, а при
+      // первом обращении к звуку — поэтому опрашиваем, пока он не появится,
+      // и сразу применяем текущее состояние (например, если звук был
+      // выключен пользователем в прошлый раз).
+      var audioWatcher = setInterval(function () {
+        if (window.__unityAudioContext) {
+          applyAudioState();
+          clearInterval(audioWatcher);
+        }
+      }, 300);
+
+      function setBackgrounded(isBackgrounded) {
+        appBackgrounded = isBackgrounded;
+        applyAudioState();
+      }
+
+      // Основной сценарий внутри приложения VK — сообщения от самого VK
+      // о сворачивании/разворачивании мини-приложения.
+      // См. https://dev.vk.com/ru/games/how-to/handle-minimize-and-restore-events
+      vkBridge.subscribe(function (e) {
+        if (!e || !e.detail) return;
+        switch (e.detail.type) {
+          case 'VKWebAppViewHide':
+            setBackgrounded(true);
+            break;
+          case 'VKWebAppViewRestore':
+            setBackgrounded(false);
+            break;
+        }
+      });
+
+      // Доп. подстраховка на случай обычного сворачивания вкладки/браузера.
+      document.addEventListener('visibilitychange', function () {
+        setBackgrounded(document.hidden);
+      });
+
+      // ===================================================================
+      // п.5: онбординг при первом запуске
+      // ===================================================================
+      var ONBOARDING_KEY = 'yarojump_onboarding_seen';
+      var onboardingOverlay = document.getElementById('onboarding-overlay');
+      var onboardingCloseButton = document.getElementById('onboarding-close-button');
+
+      if (localStorage.getItem(ONBOARDING_KEY) === '1') {
+        onboardingOverlay.style.display = 'none';
+      }
+
+      onboardingCloseButton.addEventListener('click', function () {
+        onboardingOverlay.style.display = 'none';
+        localStorage.setItem(ONBOARDING_KEY, '1');
+      });
 
     </script>
-    
+
   </body>
 </html>
